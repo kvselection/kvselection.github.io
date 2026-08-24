@@ -1,0 +1,103 @@
+name: Add affiliate product
+
+on:
+  workflow_dispatch:
+    inputs:
+      affiliate_url:
+        description: 'Amazon/Myntra affiliate or product URL'
+        required: true
+        type: string
+      store:
+        description: 'Store (auto, amazon, myntra)'
+        required: false
+        default: auto
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  add-product:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch product metadata
+        env:
+          AFFILIATE_URL: ${{ inputs.affiliate_url }}
+          STORE_INPUT: ${{ inputs.store }}
+        run: |
+          python - <<'PY'
+          import os, re, html, json, subprocess, urllib.parse
+          from pathlib import Path
+
+          url=os.environ['AFFILIATE_URL'].strip()
+          store=os.environ.get('STORE_INPUT','auto').strip().lower()
+          if not re.match(r'^https?://', url): raise SystemExit('Please enter a full http/https URL.')
+          if store=='auto':
+              host=urllib.parse.urlparse(url).netloc.lower()
+              store='amazon' if 'amazon.' in host or 'amzn.' in host or 'link.amazon' in host else ('myntra' if 'myntr.' in host or 'myntra.' in host else 'product')
+
+          cmd=['curl','-L','--max-time','25','-A','Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36',url,'-o','/tmp/page.html','-sS']
+          subprocess.run(cmd,check=True)
+          raw=Path('/tmp/page.html').read_text(errors='ignore')
+
+          def meta(prop):
+              patterns=[rf'<meta[^>]+(?:property|name)=["\']{re.escape(prop)}["\'][^>]+content=["\']([^"\']+)', rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{re.escape(prop)}["\']']
+              for p in patterns:
+                  m=re.search(p,raw,re.I)
+                  if m:return html.unescape(m.group(1)).strip()
+              return ''
+          title=meta('og:title') or meta('twitter:title')
+          image=meta('og:image') or meta('twitter:image')
+          price=meta('product:price:amount') or meta('og:price:amount')
+          if not title:
+              m=re.search(r'<title[^>]*>(.*?)</title>',raw,re.I|re.S); title=html.unescape(re.sub(r'\s+',' ',m.group(1))).strip() if m else 'New Product'
+          if not image:
+              raise SystemExit('Could not find a product image on this page. Add the product image manually.')
+          if image.startswith('//'): image='https:'+image
+          if not re.match(r'^https?://',image): image=urllib.parse.urljoin(url,image)
+
+          safe=re.sub(r'[^a-z0-9]+','-',title.lower()).strip('-')[:45] or 'product'
+          existing=list(Path('images').glob('product-*')) if Path('images').exists() else []
+          nums=[]
+          for p in existing:
+              m=re.match(r'product-(\d+)\.',p.name,re.I)
+              if m: nums.append(int(m.group(1)))
+          n=max(nums or [0])+1
+          ext='.jpg'
+          low=image.lower().split('?')[0]
+          if low.endswith('.png'): ext='.png'
+          elif low.endswith('.webp'): ext='.webp'
+          filename=f'product-{n:02d}{ext}'
+          subprocess.run(['curl','-L','--max-time','25','-A','Mozilla/5.0',image,'-o',f'images/{filename}','-sS'],check=True)
+          if Path(f'images/{filename}').stat().st_size < 1000: raise SystemExit('Product image download failed.')
+
+          data={'name':title[:100],'image':f'images/{filename}','price':price,'store':store,'url':url}
+          Path('/tmp/product.json').write_text(json.dumps(data))
+          print(json.dumps(data,indent=2))
+          PY
+
+      - name: Add product card
+        run: |
+          python - <<'PY'
+          import json,re,html
+          from pathlib import Path
+          d=json.loads(Path('/tmp/product.json').read_text())
+          p=Path('index.html'); s=p.read_text()
+          name=html.escape(d['name']); img=html.escape(d['image'],quote=True); url=html.escape(d['url'],quote=True)
+          price=html.escape(d['price'] or 'Check Price')
+          label='Buy on Amazon' if d['store']=='amazon' else ('Buy on Myntra' if d['store']=='myntra' else 'Buy Now')
+          card=f'''<article class="card"><img src="{img}" alt="{name}"><div class="info"><span class="tag">{d['store'].upper()}</span><h3>{name}</h3><div class="price">{price}</div><a class="order amazon" href="{url}" target="_blank" rel="nofollow sponsored">{label}</a></div></article>'''
+          s=s.replace('</div></section>',card+'</div></section>',1)
+          p.write_text(s)
+          PY
+
+      - name: Commit product
+        run: |
+          git config user.name 'KV Selection Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add index.html images/
+          git commit -m "Add affiliate product" || echo "No changes to commit"
+          git push
